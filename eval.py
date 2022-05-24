@@ -1,26 +1,18 @@
+import sys
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+from scipy.ndimage import find_objects, label
+import glob
 import tensorflow as tf
-import os
 from tqdm import tqdm
 import cv2
-from PIL import Image
-from sklearn.model_selection import train_test_split
-from PIL import Image
-import pytesseract
+from PIL import Image, ImageColor, ImageFilter, ImageDraw
+import xml.etree.ElementTree as ET
 from tensorflow.keras.layers import Input
-from tensorflow.keras.layers import Conv2D, Conv2DTranspose, BatchNormalization, Concatenate, Add, Activation, UpSampling2D, Dropout
+from tensorflow.keras.layers import Conv2D, Conv2DTranspose, Concatenate, UpSampling2D, Dropout
 from tensorflow.keras.models import Model
-from tensorflow.keras.utils import plot_model
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, EarlyStopping
-from tensorflow.keras.applications import VGG19
 from tensorflow.keras import regularizers
 from tensorflow.keras.applications.densenet import DenseNet121
-from PIL.Image import frombuffer
-from numpy.core.fromnumeric import size
-import streamlit as st
+
 
 # Classes for the custom decoders
 # table decoder
@@ -53,6 +45,7 @@ class table_decoder(tf.keras.layers.Layer):
         fin = self.upsamp_out(x)
         
         return fin
+
 
 # column decoder
 class col_decoder(tf.keras.layers.Layer):
@@ -87,6 +80,7 @@ class col_decoder(tf.keras.layers.Layer):
         fin = self.upsamp_out(x)
         
         return fin
+
 
 # making the model archtecture
 def ModelConstructor():
@@ -134,6 +128,7 @@ def ModelConstructor():
 
     return tablenet
 
+
 # HELPER FUNCTIONS
 def decode_image(uploader):
     '''
@@ -148,7 +143,8 @@ def decode_image(uploader):
     image_decoded = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), -1)[:,:,:3]
     
     return image_decoded
-    
+
+
 def predict_masks(image, model):
     '''
         This function takes the image tensor, preprocesses it and predicts the table and column masks from the image.
@@ -166,6 +162,7 @@ def predict_masks(image, model):
 
     return (im, table_mask, col_mask)
 
+
 def get_mask_image(mask_pred):
     '''
         This function gets the predicted mask image from the masks predicted by the model
@@ -176,6 +173,7 @@ def get_mask_image(mask_pred):
     mask_pred = mask_pred[..., tf.newaxis][0]
     
     return mask_pred
+
 
 def filter_table(image, table_mask):
     '''
@@ -193,25 +191,150 @@ def filter_table(image, table_mask):
     
     return im
 
-def OCR_Reader(image):
-    '''
-        This function takes an image as input and uses pytesseract to read and return the textual content in the image.
-    '''
-    text_data = pytesseract.image_to_string(image)
-    return text_data
 
 def image_reader(image_fname):
-    im = Image.open(image_fname)
-    return numpy.array(im)
+    im = Image.open(image_fname).convert("RGB")
+    return np.array(im)
+
+
+def read_sample(xml_file):
+    tree = ET.parse(xml_file)
+    root = tree.getroot()
+    bboxes = []
+    for object_ in root.iter('object'):
+        ymin, xmin, ymax, xmax = None, None, None, None
+        for box in object_.findall("bndbox"):
+            ymin = int(box.find("ymin").text)
+            xmin = int(box.find("xmin").text)
+            ymax = int(box.find("ymax").text)
+            xmax = int(box.find("xmax").text)
+
+        bbox = [xmin, ymin, xmax, ymax] # PASCAL VOC
+        bboxes.append(bbox)
+    im_file = root.find("filename").text
+    return im_file, bboxes
+
+def post_process_bbox(table_mask, size, hw_thresh=10, area_thresh=500):
+    table_mask = tf.squeeze(table_mask, axis=-1).numpy()
+    page_w, page_h = size
+#     print(page_w, page_h)
+    resized_w, resized_h = table_mask.shape[:2]
+#     print(resized_w, resized_h)
+    w_ratio = page_w / resized_w
+    h_ratio = page_h / resized_h
+    
+    labeled, num_feature = label(table_mask)
+#     display(Image.fromarray(table_mask.astype('uint8') * 255))
+#     print(labeled.shape)
+#     plt.imshow(labeled, cmap='nipy_spectral')
+#     plt.show()
+    slices = find_objects(labeled)
+    bboxes = list()
+#     print(len(slices), len(slices[0]), num_feature)
+    for i, (y_slice, x_slice) in enumerate(slices):
+        if np.sum(np.where(labeled == i + 1, 1, 0)) <= area_thresh:
+            continue 
+        x0 = x_slice.start * w_ratio
+        x1 = x_slice.stop * w_ratio
+        y0 = y_slice.start * h_ratio
+        y1 = y_slice.stop * h_ratio
+        if x1 - x0 < hw_thresh or y1 - y0 < hw_thresh:
+            continue
+        if (x1 - x0) * (y1 - y0) < area_thresh:
+            continue
+        bboxes.append((int(x0), int(y0), int(x1), int(y1)))
+    return bboxes
+
+def post_process_mask(table_mask, size):
+    mask = tf.image.resize(table_mask, size)
+    mask = tf.squeeze(tf.where(mask > 0.5, True, False), axis=-1)
+    return mask.numpy()
+
+
+def generalized_iou(bbox_true, table_mask, im_h, im_w):
+    # compute IoU
+    pred_matched = set()
+    img_gt = np.zeros_like(table_mask, dtype=bool)
+    for tb in bbox_true:
+        img_gt[int(tb[1]): int(tb[3]), int(tb[0]): int(tb[2])] = True
+        
+    I = np.logical_and(table_mask, img_gt)
+    U = np.logical_or(table_mask, img_gt)
+    return I.sum() / U.sum(), len(bbox_true)
+            
+class F1Score:
+    def __init__(self, IoU_thresh=0.5, area_thresh=1000):
+        self.true_positive = 0
+        self.false_positive = 0
+        self.truth_count = 0
+        self._iou_thresh = IoU_thresh
+        self._area_thresh = area_thresh
+        self._iou_total = 0
+        self._iou_count = 0
+    
+    def update_state(self, n_truth, IoUs, areas=None):
+        if areas is not None:
+            IoUs = [i for (i, a) in zip(IoUs, areas) if a > self._area_thresh]
+        self._iou_total += sum(IoUs)
+        self._iou_count += len(IoUs)
+        n_tp = sum(1 for i in IoUs if i >= self._iou_thresh)
+        n_fp = len(IoUs) - n_tp
+        self.true_positive += n_tp
+        self.false_positive += n_fp
+        self.truth_count += n_truth
+    
+    @property
+    def precision(self):
+        return self.true_positive / max(1, self.true_positive + self.false_positive)
+    
+    @property
+    def recall(self):
+        return self.true_positive / max(1, self.truth_count)
+    
+    @property
+    def f1(self):
+        return (2 * self.precision * self.recall) / max(1, self.precision + self.recall)
+    
+    @property
+    def iou(self):
+        return self._iou_total / max(1, self._iou_count)
 
 
 if __name__ == "__main__":
-    import sys
     tablenet = ModelConstructor()
-    # print(tablenet.summary()) 
-    im = image_reader(sys.argv[1])
-    print(im.shape)
-    im, table_mask, col_mask = predict_masks(im, tablenet)
-    table_mask_img = get_mask_image(table_mask)
-    col_mask_img = get_mask_image(col_mask)
-    print(table_mask_img.shape, col_mask_img.shape)
+    
+    data_path = "/home/shiki/hdd/WikiTableExtraction/detection"
+    test_files = list()
+    with open(f"{data_path}/test_filelist.txt") as fp:
+        for line in fp:
+            test_files.append(line.strip())
+    metrics = [(0.5, F1Score(0.5, 100)), (0.75, F1Score(0.75, 100)), (0.95, F1Score(0.95, 100))]
+    for xml_fname in tqdm(test_files):
+        im_fname, true_bbox = read_sample(f"{data_path}/{xml_fname}")
+        im = image_reader(f"{data_path}/images/{im_fname}")
+        h, w = im.shape[:2]
+        
+        _, table_mask, col_mask = predict_masks(im, tablenet)
+        table_mask_img = get_mask_image(table_mask)
+        col_mask_img = get_mask_image(col_mask)
+        mask_resized = post_process_mask(table_mask_img, (h, w))
+        this_iou, true_count = generalized_iou(true_bbox, mask_resized, w, h)
+        for _, metric in metrics:
+            metric.update_state(1, [this_iou])
+        
+        continue    # remove this line to save image 
+        image = Image.fromarray(im, mode="RGB").convert("RGBA")
+        mask_alpha = Image.fromarray((mask_resized * 255).astype('uint8')).convert("L")
+        green_mask = Image.new('RGB', image.size, color='green')
+        green_mask.putalpha(mask_alpha)
+        mask = Image.new("RGB", green_mask.size, (255, 255, 255))
+        mask.paste(green_mask, mask=green_mask.split()[3])
+        bboxes = post_process_bbox(table_mask_img, (w, h))
+        draw = ImageDraw.Draw(image)
+        for box in bboxes:
+            draw.rectangle(box, outline='green', width=5)
+        final_im = Image.blend(image, mask.convert("RGBA"), alpha=0.5)
+        final_im.save(f"output_vis/{im_fname}")
+    
+    for thresh, metric in metrics:
+        print(metric.precision, metric.recall, metric.f1, metric.iou)
