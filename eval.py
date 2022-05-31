@@ -215,22 +215,17 @@ def read_sample(xml_file):
     return im_file, bboxes
 
 def post_process_bbox(table_mask, size, hw_thresh=10, area_thresh=500):
+    """ for visualization purpose only, not for evaluation"""
     table_mask = tf.squeeze(table_mask, axis=-1).numpy()
     page_w, page_h = size
-#     print(page_w, page_h)
     resized_w, resized_h = table_mask.shape[:2]
-#     print(resized_w, resized_h)
     w_ratio = page_w / resized_w
     h_ratio = page_h / resized_h
     
     labeled, num_feature = label(table_mask)
-#     display(Image.fromarray(table_mask.astype('uint8') * 255))
-#     print(labeled.shape)
-#     plt.imshow(labeled, cmap='nipy_spectral')
 #     plt.show()
     slices = find_objects(labeled)
     bboxes = list()
-#     print(len(slices), len(slices[0]), num_feature)
     for i, (y_slice, x_slice) in enumerate(slices):
         if np.sum(np.where(labeled == i + 1, 1, 0)) <= area_thresh:
             continue 
@@ -262,23 +257,20 @@ def generalized_iou(bbox_true, table_mask, im_h, im_w):
     U = np.logical_or(table_mask, img_gt)
     return I.sum() / U.sum(), len(bbox_true)
             
-class F1Score:
-    def __init__(self, IoU_thresh=0.5, area_thresh=1000):
+class PixelAccuracy:
+    def __init__(self):
         self.true_positive = 0
         self.false_positive = 0
         self.truth_count = 0
-        self._iou_thresh = IoU_thresh
-        self._area_thresh = area_thresh
-        self._iou_total = 0
-        self._iou_count = 0
     
-    def update_state(self, n_truth, IoUs, areas=None):
-        if areas is not None:
-            IoUs = [i for (i, a) in zip(IoUs, areas) if a > self._area_thresh]
-        self._iou_total += sum(IoUs)
-        self._iou_count += len(IoUs)
-        n_tp = sum(1 for i in IoUs if i >= self._iou_thresh)
-        n_fp = len(IoUs) - n_tp
+    def update_state(self, mask, true_bbox):
+        image = np.zeros_like(mask, dtype=bool)
+        for x0, y0, x1, y1 in true_bbox:
+            image[x0: x1, y0: y1] = True
+        n_truth = np.sum(image)
+        I = np.logical_and(mask, image)
+        n_tp = np.sum(I)
+        n_fp = np.sum(mask) - n_tp
         self.true_positive += n_tp
         self.false_positive += n_fp
         self.truth_count += n_truth
@@ -295,12 +287,7 @@ class F1Score:
     def f1(self):
         return (2 * self.precision * self.recall) / max(1, self.precision + self.recall)
     
-    @property
-    def iou(self):
-        return self._iou_total / max(1, self._iou_count)
-
-
-if __name__ == "__main__":
+def main():
     tablenet = ModelConstructor()
     
     data_path = "/home/shiki/hdd/WikiTableExtraction/detection"
@@ -308,7 +295,7 @@ if __name__ == "__main__":
     with open(f"{data_path}/test_filelist.txt") as fp:
         for line in fp:
             test_files.append(line.strip())
-    metrics = [(0.5, F1Score(0.5, 100)), (0.75, F1Score(0.75, 100)), (0.95, F1Score(0.95, 100))]
+    metric = PixelAccuracy()
     for xml_fname in tqdm(test_files):
         im_fname, true_bbox = read_sample(f"{data_path}/{xml_fname}")
         im = image_reader(f"{data_path}/images/{im_fname}")
@@ -318,9 +305,8 @@ if __name__ == "__main__":
         table_mask_img = get_mask_image(table_mask)
         col_mask_img = get_mask_image(col_mask)
         mask_resized = post_process_mask(table_mask_img, (h, w))
-        this_iou, true_count = generalized_iou(true_bbox, mask_resized, w, h)
-        for _, metric in metrics:
-            metric.update_state(1, [this_iou])
+        # this_iou, true_count = generalized_iou(true_bbox, mask_resized, w, h)
+        metric.update_state(mask_resized, true_bbox)
         
         continue    # remove this line to save image 
         image = Image.fromarray(im, mode="RGB").convert("RGBA")
@@ -336,5 +322,9 @@ if __name__ == "__main__":
         final_im = Image.blend(image, mask.convert("RGBA"), alpha=0.5)
         final_im.save(f"output_vis/{im_fname}")
     
-    for thresh, metric in metrics:
-        print(metric.precision, metric.recall, metric.f1, metric.iou)
+    print(metric.precision, metric.recall, metric.f1)
+
+
+if __name__ == "__main__":
+    with tf.device("/GPU:0"):
+        main()
